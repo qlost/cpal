@@ -27,6 +27,7 @@ use windows::{
         System::{
             Com,
             Com::{StructuredStorage, STGM_READ},
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
             Threading,
             Variant::{VT_LPWSTR, VT_UI4},
         },
@@ -343,6 +344,37 @@ fn enumerator_to_interface_type(enumerator: &str) -> Option<InterfaceType> {
     Some(typ)
 }
 
+type ActivateAudioInterfaceAsyncFn = unsafe extern "system" fn(
+    device_interface_path: windows::core::PWSTR,
+    riid: *const windows::core::GUID,
+    activation_params: *const core::ffi::c_void,
+    completion_handler: *mut core::ffi::c_void,
+    activation_operation: *mut *mut core::ffi::c_void,
+) -> windows::core::HRESULT;
+
+/// `ActivateAudioInterfaceAsync` is exported by `Mmdevapi.dll` only since Windows 8; on
+/// Windows 7 it is absent. It is loaded dynamically (`GetProcAddress`) so the binary carries no
+/// static import of that symbol and stays loadable on Windows 7.
+static ACTIVATE_AUDIO_INTERFACE_ASYNC: OnceLock<Option<ActivateAudioInterfaceAsyncFn>> =
+    OnceLock::new();
+
+fn activate_audio_interface_async_fn() -> windows::core::Result<ActivateAudioInterfaceAsyncFn> {
+    (*ACTIVATE_AUDIO_INTERFACE_ASYNC
+        .get_or_init(|| {
+            let mmdevapi = unsafe { LoadLibraryW(windows::core::w!("Mmdevapi.dll")) }.ok()?;
+            let proc = unsafe {
+                GetProcAddress(mmdevapi, windows::core::s!("ActivateAudioInterfaceAsync"))
+            }?;
+            Some(unsafe { mem::transmute(proc) })
+        }))
+    .ok_or_else(|| {
+        windows::core::Error::new(
+            windows::core::HRESULT::from_win32(127), // ERROR_PROC_NOT_FOUND
+            "ActivateAudioInterfaceAsync is not available (Windows 8+)",
+        )
+    })
+}
+
 /// Activates an `IAudioClient` via `ActivateAudioInterfaceAsync` synchronously.
 ///
 /// Used for virtual default-device GUIDs (`DEVINTERFACE_AUDIO_RENDER`/`DEVINTERFACE_AUDIO_CAPTURE`)
@@ -387,12 +419,19 @@ unsafe fn activate_audio_interface_sync(
 
     let (tx, rx) = std::sync::mpsc::channel();
     let handler: Audio::IActivateAudioInterfaceCompletionHandler = CompletionHandler(tx).into();
-    Audio::ActivateAudioInterfaceAsync(
-        device_interface_path,
-        &Audio::IAudioClient::IID,
-        None,
-        &handler,
-    )?;
+    // Loaded dynamically so the binary carries no static import of `ActivateAudioInterfaceAsync`
+    // from `Mmdevapi.dll` (absent on Windows 7).
+    let activate_audio_interface_async = activate_audio_interface_async_fn()?;
+    unsafe {
+        activate_audio_interface_async(
+            device_interface_path,
+            &Audio::IAudioClient::IID,
+            ptr::null(),
+            &handler as *const _ as *mut core::ffi::c_void,
+            ptr::null_mut(),
+        )
+        .ok()?;
+    }
     // If a timeout was given use it; otherwise block until Windows calls ActivateCompleted.
     // `handler` holds the sender and remains live on the stack, so `recv` cannot fail.
     let result = if let Some(dur) = activation_timeout {
